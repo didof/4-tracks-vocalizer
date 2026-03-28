@@ -170,6 +170,8 @@ const App = () => {
   const masterRef = useRef({ duration: 0, startTime: 0 });
   const sourcesRef = useRef([]);
   const liveDataRef = useRef(Array(4).fill(null).map(() => new Float32Array(1000)));
+  const recordersRef = useRef([]);
+  const timeoutsRef = useRef([]);
 
   const initAudio = async () => {
     try {
@@ -232,12 +234,19 @@ const App = () => {
 
     const chunks = [];
     const recorder = new MediaRecorder(streamRef.current);
+    let isCancelled = false;
+
+    recorder.cancel = () => { isCancelled = true; };
+    recordersRef.current[trackIndex] = recorder;
     
     recorder.ondataavailable = e => chunks.push(e.data);
     recorder.onstop = async () => {
+      if (isCancelled) return;
       const blob = new Blob(chunks);
       const arrayBuffer = await blob.arrayBuffer();
       const decodedBuffer = await ctxRef.current.decodeAudioData(arrayBuffer);
+      if (isCancelled) return;
+
       const trimmedBuffer = trimBuffer(decodedBuffer, LOOP_DURATION, ctxRef.current);
       
       playTrack(trackIndex, trimmedBuffer);
@@ -255,7 +264,7 @@ const App = () => {
       return next;
     });
 
-    setTimeout(() => {
+    timeoutsRef.current[trackIndex] = setTimeout(() => {
       if (recorder.state === 'recording') {
         recorder.stop();
       }
@@ -275,7 +284,7 @@ const App = () => {
     const elapsed = (now - startTime) % duration;
     const timeToNext = duration - elapsed;
 
-    setTimeout(() => {
+    timeoutsRef.current[trackIndex] = setTimeout(() => {
       startRecording(trackIndex);
     }, timeToNext * 1000);
   };
@@ -292,12 +301,19 @@ const App = () => {
     
     const chunks = [];
     const recorder = new MediaRecorder(streamRef.current);
+    let isCancelled = false;
+
+    recorder.cancel = () => { isCancelled = true; };
+    recordersRef.current[trackIndex] = recorder;
     
     recorder.ondataavailable = e => chunks.push(e.data);
     recorder.onstop = async () => {
+      if (isCancelled) return;
       const blob = new Blob(chunks);
       const arrayBuffer = await blob.arrayBuffer();
       const decodedBuffer = await ctxRef.current.decodeAudioData(arrayBuffer);
+      if (isCancelled) return;
+
       const trimmedBuffer = trimBuffer(decodedBuffer, LOOP_DURATION, ctxRef.current);
       
       playTrack(trackIndex, trimmedBuffer);
@@ -310,7 +326,7 @@ const App = () => {
     
     recorder.start();
 
-    setTimeout(() => {
+    timeoutsRef.current[trackIndex] = setTimeout(() => {
       if (recorder.state === 'recording') {
         recorder.stop();
       }
@@ -337,6 +353,22 @@ const App = () => {
 
   const clearTrack = (e, index) => {
     e.stopPropagation();
+    
+    if (timeoutsRef.current[index]) {
+      clearTimeout(timeoutsRef.current[index]);
+      timeoutsRef.current[index] = null;
+    }
+
+    if (recordersRef.current[index]) {
+      if (recordersRef.current[index].cancel) {
+        recordersRef.current[index].cancel();
+      }
+      recordersRef.current[index].onstop = null;
+      if (recordersRef.current[index].state !== 'inactive') {
+        recordersRef.current[index].stop();
+      }
+      recordersRef.current[index] = null;
+    }
     
     if (sourcesRef.current[index]) {
       sourcesRef.current[index].stop();
