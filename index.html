@@ -1,0 +1,406 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Mic, Square, Disc3, Clock, Trash2, AlertCircle } from 'lucide-react';
+
+const LOOP_DURATION = 4.0; 
+
+const Timeline = ({ tracks, masterRef, ctxRef, analyserRef, liveDataRef }) => {
+  const canvasRef = useRef(null);
+  const reqRef = useRef(null);
+  
+  const colors = ['#10b981', '#3b82f6', '#8b5cf6', '#f59e0b'];
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    
+    const c = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    const trackHeight = height / 4;
+
+    const draw = () => {
+      c.clearRect(0, 0, width, height);
+      const now = ctxRef.current ? ctxRef.current.currentTime : 0;
+
+      tracks.forEach((track, i) => {
+        const amp = trackHeight / 2;
+        const yOffset = (i * trackHeight) + amp;
+
+        c.beginPath();
+        c.strokeStyle = colors[i];
+        c.lineWidth = 2;
+        c.globalAlpha = 0.9;
+
+        if (track.state === 'recording' && analyserRef.current && masterRef.current.duration > 0) {
+          const data = new Float32Array(analyserRef.current.fftSize);
+          analyserRef.current.getFloatTimeDomainData(data);
+          let maxAmp = 0;
+          for(let k = 0; k < data.length; k++) {
+            if (Math.abs(data[k]) > maxAmp) maxAmp = Math.abs(data[k]);
+          }
+          
+          let elapsed = (now - masterRef.current.startTime) % masterRef.current.duration;
+          if (elapsed < 0) elapsed = 0;
+          
+          const progress = elapsed / masterRef.current.duration;
+          const x = Math.floor(progress * width);
+          
+          if (x >= 0 && x < width && liveDataRef.current[i]) {
+            const currentArr = liveDataRef.current[i];
+            currentArr[x] = maxAmp;
+            if (currentArr.lastX !== undefined && x > currentArr.lastX + 1) {
+               for(let f = currentArr.lastX + 1; f < x; f++) currentArr[f] = maxAmp;
+            }
+            currentArr.lastX = x;
+          }
+          
+          for (let px = 0; px < width; px++) {
+            const val = liveDataRef.current[i][px] || 0;
+            c.moveTo(px, yOffset - val * amp * 0.85);
+            c.lineTo(px, yOffset + val * amp * 0.85);
+          }
+        } else if (track.buffer && (track.state === 'playing' || track.state === 'empty')) {
+          const data = track.buffer.getChannelData(0);
+          const step = Math.ceil(data.length / width);
+          for (let x = 0; x < width; x++) {
+            let min = 1.0;
+            let max = -1.0;
+            for (let j = 0; j < step; j++) {
+              const datum = data[x * step + j] || 0;
+              if (datum < min) min = datum;
+              if (datum > max) max = datum;
+            }
+            c.moveTo(x, yOffset + min * amp * 0.85);
+            c.lineTo(x, yOffset + max * amp * 0.85);
+          }
+        } else {
+          c.moveTo(0, yOffset);
+          c.lineTo(width, yOffset);
+          c.globalAlpha = 0.2;
+        }
+        c.stroke();
+      });
+
+      if (masterRef.current.duration > 0 && ctxRef.current) {
+        const elapsed = (now - masterRef.current.startTime) % masterRef.current.duration;
+        const progress = Math.max(0, elapsed) / masterRef.current.duration;
+        const x = progress * width;
+
+        c.beginPath();
+        c.strokeStyle = '#ef4444';
+        c.lineWidth = 2;
+        c.globalAlpha = 1;
+        c.moveTo(x, 0);
+        c.lineTo(x, height);
+        c.stroke();
+      }
+
+      reqRef.current = requestAnimationFrame(draw);
+    };
+
+    reqRef.current = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(reqRef.current);
+  }, [tracks, masterRef, ctxRef, analyserRef, liveDataRef]);
+
+  return (
+    <div className="w-full relative shrink-0">
+      <canvas 
+        ref={canvasRef} 
+        width={1000} 
+        height={160} 
+        className="w-full h-40 bg-zinc-900 rounded-2xl border-2 border-zinc-800 shadow-inner block"
+      />
+      <div className="absolute top-0 left-0 w-full h-full flex flex-col pointer-events-none rounded-2xl overflow-hidden">
+        {tracks.map((t, i) => (
+          <div key={i} className="flex-1 border-b border-white/5 last:border-0 flex items-center px-3">
+            <span 
+              className={`text-[10px] font-mono font-bold ${t.buffer || t.state === 'recording' ? 'opacity-100' : 'opacity-30'}`} 
+              style={{ color: colors[i] }}
+            >
+              T{i + 1}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default function App() {
+  const [tracks, setTracks] = useState(
+    Array(4).fill().map((_, i) => ({ id: i, state: 'empty', buffer: null }))
+  );
+  const [error, setError] = useState('');
+
+  const ctxRef = useRef(null);
+  const streamRef = useRef(null);
+  const analyserRef = useRef(null);
+  const masterRef = useRef({ duration: 0, startTime: 0 });
+  const sourcesRef = useRef([]);
+  const liveDataRef = useRef(Array(4).fill(null).map(() => new Float32Array(1000)));
+
+  const initAudio = async () => {
+    try {
+      if (!ctxRef.current) {
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        ctxRef.current = new AudioContext();
+      }
+      if (!streamRef.current) {
+        streamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+      if (!analyserRef.current) {
+        const analyser = ctxRef.current.createAnalyser();
+        analyser.fftSize = 2048;
+        const source = ctxRef.current.createMediaStreamSource(streamRef.current);
+        source.connect(analyser);
+        analyserRef.current = analyser;
+      }
+      if (ctxRef.current.state === 'suspended') {
+        await ctxRef.current.resume();
+      }
+      setError('');
+    } catch (err) {
+      setError('Microphone access required to use the looper.');
+      throw err;
+    }
+  };
+
+  const trimBuffer = (buffer, targetDuration, ctx) => {
+    const targetFrames = Math.floor(targetDuration * ctx.sampleRate);
+    const newBuffer = ctx.createBuffer(buffer.numberOfChannels, targetFrames, ctx.sampleRate);
+    for (let i = 0; i < buffer.numberOfChannels; i++) {
+      const channelData = buffer.getChannelData(i);
+      const newChannelData = newBuffer.getChannelData(i);
+      for (let j = 0; j < targetFrames; j++) {
+        newChannelData[j] = j < channelData.length ? channelData[j] : 0;
+      }
+    }
+    return newBuffer;
+  };
+
+  const playTrack = (index, buffer) => {
+    const source = ctxRef.current.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    source.connect(ctxRef.current.destination);
+    
+    const now = ctxRef.current.currentTime;
+    const elapsed = now - masterRef.current.startTime;
+    const offset = Math.max(0, elapsed % masterRef.current.duration);
+    
+    source.start(now, offset);
+    sourcesRef.current[index] = source;
+  };
+
+  const startFirstRecording = (trackIndex) => {
+    liveDataRef.current[trackIndex].fill(0);
+    liveDataRef.current[trackIndex].lastX = 0;
+    masterRef.current.duration = LOOP_DURATION;
+    masterRef.current.startTime = ctxRef.current.currentTime;
+
+    const chunks = [];
+    const recorder = new MediaRecorder(streamRef.current);
+    
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+      const blob = new Blob(chunks);
+      const arrayBuffer = await blob.arrayBuffer();
+      const decodedBuffer = await ctxRef.current.decodeAudioData(arrayBuffer);
+      const trimmedBuffer = trimBuffer(decodedBuffer, LOOP_DURATION, ctxRef.current);
+      
+      playTrack(trackIndex, trimmedBuffer);
+      setTracks(prev => {
+        const next = [...prev];
+        next[trackIndex] = { ...next[trackIndex], state: 'playing', buffer: trimmedBuffer };
+        return next;
+      });
+    };
+    
+    recorder.start();
+    setTracks(prev => {
+      const next = [...prev];
+      next[trackIndex] = { ...next[trackIndex], state: 'recording' };
+      return next;
+    });
+
+    setTimeout(() => {
+      if (recorder.state === 'recording') {
+        recorder.stop();
+      }
+    }, LOOP_DURATION * 1000);
+  };
+
+  const armRecording = (trackIndex) => {
+    setTracks(prev => {
+      const next = [...prev];
+      next[trackIndex] = { ...next[trackIndex], state: 'armed' };
+      return next;
+    });
+
+    const ctx = ctxRef.current;
+    const { duration, startTime } = masterRef.current;
+    const now = ctx.currentTime;
+    const elapsed = (now - startTime) % duration;
+    const timeToNext = duration - elapsed;
+
+    setTimeout(() => {
+      startRecording(trackIndex);
+    }, timeToNext * 1000);
+  };
+
+  const startRecording = (trackIndex) => {
+    setTracks(prev => {
+      const next = [...prev];
+      next[trackIndex] = { ...next[trackIndex], state: 'recording' };
+      return next;
+    });
+
+    liveDataRef.current[trackIndex].fill(0);
+    liveDataRef.current[trackIndex].lastX = 0;
+    
+    const chunks = [];
+    const recorder = new MediaRecorder(streamRef.current);
+    
+    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.onstop = async () => {
+      const blob = new Blob(chunks);
+      const arrayBuffer = await blob.arrayBuffer();
+      const decodedBuffer = await ctxRef.current.decodeAudioData(arrayBuffer);
+      const trimmedBuffer = trimBuffer(decodedBuffer, LOOP_DURATION, ctxRef.current);
+      
+      playTrack(trackIndex, trimmedBuffer);
+      setTracks(prev => {
+        const next = [...prev];
+        next[trackIndex] = { ...next[trackIndex], state: 'playing', buffer: trimmedBuffer };
+        return next;
+      });
+    };
+    
+    recorder.start();
+
+    setTimeout(() => {
+      if (recorder.state === 'recording') {
+        recorder.stop();
+      }
+    }, LOOP_DURATION * 1000);
+  };
+
+  const handleTrackAction = async (trackIndex) => {
+    try {
+      await initAudio();
+    } catch (e) {
+      return;
+    }
+
+    const track = tracks[trackIndex];
+
+    if (track.state === 'empty') {
+      if (masterRef.current.duration === 0) {
+        startFirstRecording(trackIndex);
+      } else {
+        armRecording(trackIndex);
+      }
+    }
+  };
+
+  const clearTrack = (e, index) => {
+    e.stopPropagation();
+    
+    if (sourcesRef.current[index]) {
+      sourcesRef.current[index].stop();
+      sourcesRef.current[index].disconnect();
+      sourcesRef.current[index] = null;
+    }
+    
+    if (liveDataRef.current[index]) {
+      liveDataRef.current[index].fill(0);
+      liveDataRef.current[index].lastX = 0;
+    }
+    
+    setTracks(prev => {
+      const next = [...prev];
+      next[index] = { id: index, state: 'empty', buffer: null };
+      
+      const isAllEmpty = next.every(t => t.state === 'empty' && t.buffer === null);
+      if (isAllEmpty) {
+        masterRef.current = { duration: 0, startTime: 0 };
+      }
+      
+      return next;
+    });
+  };
+
+  const getTrackStyle = (state) => {
+    switch (state) {
+      case 'empty':
+        return 'bg-zinc-800 border-zinc-700 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-200 cursor-pointer';
+      case 'armed':
+        return 'bg-yellow-500/10 border-yellow-500 text-yellow-500 animate-pulse cursor-default';
+      case 'recording':
+        return 'bg-red-500/10 border-red-500 text-red-500 shadow-[0_0_30px_rgba(239,68,68,0.3)] animate-pulse cursor-default';
+      case 'playing':
+        return 'bg-green-500/10 border-green-500 text-green-500 shadow-[0_0_30px_rgba(34,197,94,0.1)] cursor-default';
+      default:
+        return '';
+    }
+  };
+
+  return (
+    <div className="h-[100dvh] w-full bg-black text-white flex flex-col items-center justify-center p-4 font-sans overflow-hidden">
+      <div className="max-w-2xl w-full h-full flex flex-col gap-4">
+        
+        <Timeline 
+          tracks={tracks} 
+          masterRef={masterRef} 
+          ctxRef={ctxRef} 
+          analyserRef={analyserRef}
+          liveDataRef={liveDataRef}
+        />
+
+        {error && (
+          <div className="inline-flex items-center gap-2 text-red-400 bg-red-950/50 px-4 py-3 rounded-xl text-sm border border-red-900/50 justify-center shrink-0">
+            <AlertCircle size={16} />
+            {error}
+          </div>
+        )}
+
+        <div className="flex-1 min-h-0 w-full grid grid-cols-2 gap-4 pb-2">
+          {tracks.map((track, i) => (
+            <div
+              key={track.id}
+              onClick={() => handleTrackAction(i)}
+              className={`relative flex flex-col items-center justify-center rounded-3xl border-2 transition-all duration-300 h-full w-full ${getTrackStyle(track.state)}`}
+            >
+              {track.state !== 'empty' && (
+                <button
+                  onClick={(e) => clearTrack(e, i)}
+                  className="absolute top-4 right-4 p-2 rounded-full hover:bg-white/10 text-zinc-400 hover:text-white transition-colors z-10"
+                >
+                  <Trash2 size={20} />
+                </button>
+              )}
+              
+              <div className="absolute top-4 left-6 font-mono text-sm tracking-widest opacity-50 hidden sm:block">
+                TRACK {i + 1}
+              </div>
+
+              <div className="flex flex-col items-center gap-3">
+                {track.state === 'empty' && <Mic size={40} strokeWidth={1.5} />}
+                {track.state === 'armed' && <Clock size={40} strokeWidth={1.5} />}
+                {track.state === 'recording' && <Square size={40} strokeWidth={1.5} className="fill-current" />}
+                {track.state === 'playing' && <Disc3 size={40} strokeWidth={1.5} className="animate-[spin_4s_linear_infinite]" />}
+                
+                <span className="text-xs sm:text-sm font-medium tracking-wide uppercase text-center px-2">
+                  {track.state === 'empty' && 'Record (4s)'}
+                  {track.state === 'armed' && 'Waiting'}
+                  {track.state === 'recording' && 'Recording...'}
+                  {track.state === 'playing' && 'Playing'}
+                </span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
